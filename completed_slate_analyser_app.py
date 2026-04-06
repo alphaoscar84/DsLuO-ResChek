@@ -243,6 +243,99 @@ def prepare_players_df(players: pd.DataFrame, required_status_text: str) -> pd.D
 
 
 
+def prepare_merged_df(merged: pd.DataFrame) -> pd.DataFrame:
+    player_col = find_first_existing_column(merged, ["Player", "Name"])
+    team_col = find_first_existing_column(merged, ["Team", "Team_2026", "Team_2025"], required=False)
+    avg_col = find_first_existing_column(merged, ["Average", "NewAverage", "MergedAverage"])
+    games_col = find_first_existing_column(merged, ["TotalGames", "Total_Games", "Total Games", "Games", "Gm"], required=False)
+
+    df = merged.copy()
+    rename_map = {player_col: "Player", avg_col: "MergedAverage"}
+    if team_col:
+        rename_map[team_col] = "Team"
+    df = df.rename(columns=rename_map)
+
+    if "Team" not in df.columns:
+        df["Team"] = ""
+
+    df["Total_Games"] = df[games_col] if games_col else 0
+    df["Player"] = df["Player"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+    df["Team"] = df["Team"].astype(str).str.strip()
+    df["TeamNick"] = df["Team"].map(normalise_team)
+    df["MergedAverage"] = df["MergedAverage"].apply(safe_float)
+    df["Total_Games"] = df["Total_Games"].apply(safe_int)
+
+    return df[["Player", "Team", "TeamNick", "MergedAverage", "Total_Games"]].copy()
+
+
+def match_players(players_df: pd.DataFrame, merged_df: pd.DataFrame, fallback_projection: float) -> pd.DataFrame:
+    out = players_df.merge(
+        merged_df,
+        left_on="Name",
+        right_on="Player",
+        how="left",
+        suffixes=("_players", "_merged"),
+    )
+
+    out["MatchMethod"] = out["MergedAverage"].notna().map(lambda x: "full-name" if x else "")
+    unmatched_mask = out["MergedAverage"].isna()
+
+    if unmatched_mask.any():
+        fallback = players_df.merge(
+            merged_df,
+            left_on=["Name", "TeamNick"],
+            right_on=["Player", "TeamNick"],
+            how="left",
+            suffixes=("_players", "_merged"),
+        )
+        out.loc[unmatched_mask, "MergedAverage"] = fallback.loc[unmatched_mask, "MergedAverage"].values
+        out.loc[unmatched_mask, "Total_Games"] = fallback.loc[unmatched_mask, "Total_Games"].values
+
+        fallback_match_mask = pd.notna(fallback.loc[unmatched_mask, "MergedAverage"]).values
+        out.loc[unmatched_mask, "MatchMethod"] = [
+            "full-name+team" if matched else ""
+            for matched in fallback_match_mask
+        ]
+
+    if "Team_players" in out.columns:
+        out["Team"] = out["Team_players"]
+    if "TeamNick_players" in out.columns:
+        out["TeamNick"] = out["TeamNick_players"]
+
+    out["ProjectedAverage"] = out["MergedAverage"].fillna(float(fallback_projection))
+
+    expanded_rows = []
+    unique_names = sorted(out["Name"].unique())
+    name_to_bit = {name: i for i, name in enumerate(unique_names)}
+
+    for _, row in out.iterrows():
+        for pos in row["EligiblePositions"]:
+            rec = row.to_dict()
+            rec["Position"] = pos
+            rec["PlayerKey"] = rec["Name"]
+            rec["PlayerInternalID"] = name_to_bit[rec["Name"]]
+            expanded_rows.append(rec)
+
+    expanded = pd.DataFrame(expanded_rows).reset_index(drop=True)
+    expanded["RowID"] = expanded.index
+
+    expanded["PosRankNum"] = expanded.groupby("Position")["ProjectedAverage"].rank(method="first", ascending=False).astype(int)
+    expanded["RankLabel"] = expanded.apply(
+        lambda r: f"{POS_PREFIX.get(r['Position'], r['Position'][0])}{int(r['PosRankNum'])}",
+        axis=1,
+    )
+    expanded["ActualRankNum"] = expanded.groupby("Position")["ActualScore"].rank(method="first", ascending=False)
+    expanded["ActualRankLabel"] = expanded.apply(
+        lambda r: f"{POS_PREFIX.get(r['Position'], r['Position'][0])}{int(r['ActualRankNum'])}" if pd.notna(r["ActualRankNum"]) else "",
+        axis=1,
+    )
+
+    team_to_matchup = build_team_to_matchup_map(expanded)
+    expanded["MatchupKey"] = expanded["TeamNick"].map(team_to_matchup).fillna("")
+    return expanded
+
+
+
 def derive_projection(row: pd.Series, fallback_projection: float) -> float:
     form = safe_float(row.get("Form"), default=math.nan)
     fppg = safe_float(row.get("FPPG"), default=math.nan)
@@ -482,20 +575,20 @@ def build_combo_grid(is_multi_game: bool) -> List[Tuple[int, int, float, int]]:
 
 
 
-def analyse_one_slate(uploaded_file, required_status_text: str, fallback_projection: float, top_score: float, min_prize_score: float):
+def analyse_one_slate(uploaded_file, merged_df_master: pd.DataFrame, required_status_text: str, fallback_projection: float, top_score: float, min_prize_score: float):
     players = pd.read_csv(uploaded_file)
     players_df = prepare_players_df(players, required_status_text=required_status_text)
     if players_df.empty:
         raise ValueError(f"No valid players remained after filtering in {uploaded_file.name}.")
 
-    expanded = build_expanded_from_single_csv(players_df, fallback_projection=fallback_projection)
+    expanded = match_players(players_df, merged_df_master, fallback_projection=fallback_projection)
     if expanded.empty:
         raise ValueError(f"No expanded player-position rows were built for {uploaded_file.name}.")
 
     contest_id = extract_contest_id_from_filename(uploaded_file.name)
     slate_shape = get_slate_shape(expanded)
     combo_grid = build_combo_grid(slate_shape["is_multi_game"])
-    fallback_projection_count = expanded.loc[expanded["MatchMethod"] == "fallback", ["Name"]].drop_duplicates().shape[0]
+    fallback_projection_count = expanded.loc[expanded["MatchMethod"] == "", ["Name"]].drop_duplicates().shape[0]
 
     return players_df, expanded, contest_id, slate_shape, combo_grid, fallback_projection_count, top_score, min_prize_score
 
@@ -505,21 +598,22 @@ def analyse_one_slate(uploaded_file, required_status_text: str, fallback_project
 # =========================================================
 st.set_page_config(page_title="Completed Slate Analyser", layout="wide")
 st.title("Completed Slate Analyser")
-st.caption("Upload one completed players_xxxx CSV, generate lineups from same-file projection fields, and compare generated actual scores against your manually entered slate thresholds.")
+st.caption("Upload one completed players_xxxx CSV plus your merged averages file, generate lineups from merged-average rankings, and compare generated actual scores against your manually entered slate thresholds.")
 
 with st.sidebar:
     st.header("Inputs")
     players_file = st.file_uploader("Completed players_xxxx CSV file", type=["csv"], accept_multiple_files=False)
+    merged_file = st.file_uploader("Merged averages file", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
     top_score = st.number_input("Actual top score from slate", min_value=0.0, value=1000.0, step=0.1)
     min_prize_score = st.number_input("Minimum score that won a prize", min_value=0.0, value=850.0, step=0.1)
     required_status_text = st.text_input("Required Playing Status text", value=DEFAULTS["PLAYING_STATUS_REQUIRED_TEXT"])
-    fallback_projection = st.number_input("Fallback projection (used if Form/FPPG unavailable)", min_value=0.0, value=float(DEFAULTS["FALLBACK_PROJECTION"]), step=0.1)
+    fallback_projection = st.number_input("Fallback projection (used if player missing from merged file)", min_value=0.0, value=float(DEFAULTS["FALLBACK_PROJECTION"]), step=0.1)
 
     st.header("Assumptions")
-    st.write("• Single completed-slate CSV only")
-    st.write("• Projection = average of Form and FPPG when both exist")
-    st.write("• If only one of Form/FPPG exists, that value is used")
-    st.write("• If neither exists, fallback projection is used")
+    st.write("• Single completed-slate CSV plus merged averages file")
+    st.write("• Projection = merged average where matched by player name")
+    st.write("• Fallback match also tries player name + team")
+    st.write("• If still unmatched, fallback projection is used")
     st.write("• Top 25 lineups are generated per parameter combination")
     st.write("• Salary cap = 100,000")
     st.write("• Roster = 2 DEF / 4 MID / 2 FWD / 1 RK")
@@ -532,6 +626,15 @@ if run_button:
         if players_file is None:
             st.error("Please upload one completed players_xxxx.csv file.")
             st.stop()
+        if merged_file is None:
+            st.error("Please upload the merged averages file.")
+            st.stop()
+
+        if merged_file.name.lower().endswith(".csv"):
+            merged_raw = pd.read_csv(merged_file)
+        else:
+            merged_raw = pd.read_excel(merged_file)
+        merged_df_master = prepare_merged_df(merged_raw)
 
         all_combo = []
         all_lineups = []
@@ -541,9 +644,12 @@ if run_button:
         progress = st.progress(0.0, text="0.0% complete | Step 0/1 | Elapsed: 0s | ETA: 0s")
         status_box = st.empty()
 
-        update_progress(progress, status_box, 1, 30, started, f"Reading and preparing {players_file.name}")
+        total_steps = 3
+        update_progress(progress, status_box, 1, total_steps, started, f"Reading merged averages from {merged_file.name}")
+        update_progress(progress, status_box, 2, total_steps, started, f"Reading and matching {players_file.name}")
         players_df, expanded, contest_id, slate_shape, combo_grid, fallback_projection_count, top_score, min_prize_score = analyse_one_slate(
             uploaded_file=players_file,
+            merged_df_master=merged_df_master,
             required_status_text=required_status_text,
             fallback_projection=float(fallback_projection),
             top_score=float(top_score),
@@ -551,7 +657,7 @@ if run_button:
         )
 
         fallback_detail = expanded.loc[
-            expanded["MatchMethod"] == "fallback", ["Name", "TeamNick"]
+            expanded["MatchMethod"] == "", ["Name", "TeamNick"]
         ].drop_duplicates().sort_values(["TeamNick", "Name"])
         if not fallback_detail.empty:
             for _, row in fallback_detail.iterrows():
@@ -562,8 +668,8 @@ if run_button:
                     "FallbackProjection": float(fallback_projection),
                 })
 
-        total_steps = 2 + len(combo_grid) + 1
-        current_step = 2
+        total_steps = 3 + len(combo_grid) + 1
+        current_step = 3
         update_progress(progress, status_box, current_step, total_steps, started, f"Prepared slate {contest_id}. Solving {len(combo_grid)} parameter combinations...")
 
         for combo_index, (min_diff, max_team_input, max_share, max_team_effective) in enumerate(combo_grid, start=1):
@@ -674,7 +780,7 @@ if run_button:
         with st.expander("Detailed generated lineups"):
             st.dataframe(detailed_lineups_df, use_container_width=True)
 
-        with st.expander("Players using fallback projection"):
+        with st.expander("Players unmatched to merged averages and using fallback projection"):
             if fallback_df.empty:
                 st.write("No fallback-projection players found.")
             else:
