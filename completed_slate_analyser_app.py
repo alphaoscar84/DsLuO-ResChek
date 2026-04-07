@@ -3,6 +3,7 @@ import re
 import time
 import traceback
 from pathlib import Path
+from statistics import median
 from typing import Dict, List, Tuple
 
 import pandas as pd
@@ -170,6 +171,28 @@ def format_score_list(values: List[float], top_n: int = 10) -> str:
     return ", ".join(f"{v:.2f}" for v in vals)
 
 
+def mean_or_nan(values: List[float]):
+    vals = [safe_float(v, default=math.nan) for v in values]
+    vals = [v for v in vals if not pd.isna(v)]
+    return round(sum(vals) / len(vals), 2) if vals else math.nan
+
+
+def median_or_nan(values: List[float]):
+    vals = [safe_float(v, default=math.nan) for v in values]
+    vals = [v for v in vals if not pd.isna(v)]
+    return round(float(median(vals)), 2) if vals else math.nan
+
+
+def stddev_or_nan(values: List[float]):
+    vals = [safe_float(v, default=math.nan) for v in values]
+    vals = [v for v in vals if not pd.isna(v)]
+    if len(vals) <= 1:
+        return 0.0 if len(vals) == 1 else math.nan
+    mean_val = sum(vals) / len(vals)
+    variance = sum((x - mean_val) ** 2 for x in vals) / len(vals)
+    return round(math.sqrt(variance), 2)
+
+
 # =========================================================
 # PREP
 # =========================================================
@@ -262,6 +285,7 @@ def match_players(players_df: pd.DataFrame, merged_df: pd.DataFrame, fallback_pr
             how="left",
             suffixes=("_players", "_merged"),
         )
+
         out.loc[unmatched_mask, "MergedAverage"] = fallback.loc[unmatched_mask, "MergedAverage"].values
         out.loc[unmatched_mask, "Total_Games"] = fallback.loc[unmatched_mask, "Total_Games"].values
 
@@ -298,6 +322,7 @@ def match_players(players_df: pd.DataFrame, merged_df: pd.DataFrame, fallback_pr
         .rank(method="first", ascending=False)
         .astype(int)
     )
+
     expanded["RankLabel"] = expanded.apply(
         lambda r: f"{POS_PREFIX.get(r['Position'], r['Position'][0])}{int(r['PosRankNum'])}",
         axis=1,
@@ -305,6 +330,7 @@ def match_players(players_df: pd.DataFrame, merged_df: pd.DataFrame, fallback_pr
 
     team_to_matchup = build_team_to_matchup_map(expanded)
     expanded["MatchupKey"] = expanded["TeamNick"].map(team_to_matchup).fillna("")
+
     return expanded
 
 
@@ -326,6 +352,7 @@ def solve_top_n_projected_lineups(expanded: pd.DataFrame, settings: Dict[str, ob
         "RK": df.loc[df["Position"] == "RK", "RowID"].tolist(),
         "FWD": df.loc[df["Position"] == "FWD", "RowID"].tolist(),
     }
+
     player_to_rows = df.groupby("PlayerKey")["RowID"].apply(list).to_dict()
     team_to_rows = df.groupby("TeamNick")["RowID"].apply(list).to_dict()
     matchup_to_rows = df.groupby("MatchupKey")["RowID"].apply(list).to_dict()
@@ -413,7 +440,7 @@ def solve_top_n_projected_lineups(expanded: pd.DataFrame, settings: Dict[str, ob
 # =========================================================
 # SUMMARIES
 # =========================================================
-def summarise_vs_manual_scores(
+def summarise_combo_for_slate(
     slate_id: str,
     combo_label: str,
     solved: List[Dict[str, object]],
@@ -426,12 +453,11 @@ def summarise_vs_manual_scores(
     projected_scores = sorted([safe_float(x["projected_score"]) for x in solved], reverse=True)
     actual_scores = sorted([safe_float(x["actual_score"]) for x in solved], reverse=True)
 
-    top_actual = actual_scores[0] if actual_scores else math.nan
-    top_projected = projected_scores[0] if projected_scores else math.nan
+    winning_count = sum(1 for s in actual_scores if s >= manual_top_score)
+    prize_count = sum(1 for s in actual_scores if s >= manual_min_prize_score)
 
     return {
         "SlateID": slate_id,
-        "ContestID": slate_id,
         "Combo": combo_label,
         "MinDifferent": int(settings["MIN_DIFFERENT_PLAYERS_FROM_PREVIOUS"]),
         "MaxPlayersPerTeamInput": int(settings["MAX_PLAYERS_PER_TEAM"]),
@@ -442,18 +468,81 @@ def summarise_vs_manual_scores(
         "TeamsOnSlate": slate_shape["team_count"],
         "MatchupsOnSlate": slate_shape["matchup_count"],
         "SolvedLineups": len(actual_scores),
-        "BestProjectedGeneratedScore": top_projected,
-        "BestActualGeneratedScore": top_actual,
+        "BestProjectedGeneratedScore": projected_scores[0] if projected_scores else math.nan,
+        "BestActualGeneratedScore": actual_scores[0] if actual_scores else math.nan,
         "MeanTop10ProjectedGeneratedScore": round(sum(projected_scores[:10]) / min(len(projected_scores), 10), 2) if projected_scores else math.nan,
         "MeanTop10ActualGeneratedScore": round(sum(actual_scores[:10]) / min(len(actual_scores), 10), 2) if actual_scores else math.nan,
-        "Generated>=TopScore": sum(1 for s in actual_scores if s >= manual_top_score),
-        "Generated>=MinPrizeScore": sum(1 for s in actual_scores if s >= manual_min_prize_score),
+        "Generated>=TopScore": winning_count,
+        "Generated>=MinPrizeScore": prize_count,
         "TopScoreInput": manual_top_score,
         "MinPrizeScoreInput": manual_min_prize_score,
         "Top10GeneratedActualScores": format_score_list(actual_scores, top_n=10),
         "Top10GeneratedProjectedScores": format_score_list(projected_scores, top_n=10),
+        "WonSlate": 1 if winning_count > 0 else 0,
+        "PrizedSlate": 1 if prize_count > 0 else 0,
         "UnmatchedMergedPlayers": unmatched_unique_count,
     }
+
+
+def aggregate_combo_results(per_slate_combo_df: pd.DataFrame) -> pd.DataFrame:
+    if per_slate_combo_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for combo, group in per_slate_combo_df.groupby("Combo", sort=False):
+        winner_counts = group["Generated>=TopScore"].tolist()
+        prize_counts = group["Generated>=MinPrizeScore"].tolist()
+        best_actual_scores = group["BestActualGeneratedScore"].tolist()
+        mean_top10_actual_scores = group["MeanTop10ActualGeneratedScore"].tolist()
+        solved_lineups = group["SolvedLineups"].tolist()
+
+        row0 = group.iloc[0]
+
+        rows.append({
+            "Combo": combo,
+            "MinDifferent": row0["MinDifferent"],
+            "MaxPlayersPerTeamInput": row0["MaxPlayersPerTeamInput"],
+            "MaxPlayersPerTeamEffective": row0["MaxPlayersPerTeamEffective"],
+            "MaxPlayerLineupShare": row0["MaxPlayerLineupShare"],
+            "UseMatchupCap": row0["UseMatchupCap"],
+            "MatchupCap": row0["MatchupCap"],
+            "SlatesTested": len(group),
+            "SlatesWithWinner": int((group["Generated>=TopScore"] > 0).sum()),
+            "WinnerSlateRate": round(float((group["Generated>=TopScore"] > 0).mean()), 4),
+            "SlatesWithPrize": int((group["Generated>=MinPrizeScore"] > 0).sum()),
+            "PrizeSlateRate": round(float((group["Generated>=MinPrizeScore"] > 0).mean()), 4),
+            "TotalWinningLineups": int(group["Generated>=TopScore"].sum()),
+            "TotalPrizeLineups": int(group["Generated>=MinPrizeScore"].sum()),
+            "AvgWinningLineupsPerSlate": mean_or_nan(winner_counts),
+            "AvgPrizeLineupsPerSlate": mean_or_nan(prize_counts),
+            "MedianWinningLineupsPerSlate": median_or_nan(winner_counts),
+            "MedianPrizeLineupsPerSlate": median_or_nan(prize_counts),
+            "StdDevPrizeLineups": stddev_or_nan(prize_counts),
+            "BestSingleSlateWinningCount": max(winner_counts) if winner_counts else 0,
+            "BestSingleSlatePrizeCount": max(prize_counts) if prize_counts else 0,
+            "AvgBestActualScore": mean_or_nan(best_actual_scores),
+            "MedianBestActualScore": median_or_nan(best_actual_scores),
+            "AvgMeanTop10ActualScore": mean_or_nan(mean_top10_actual_scores),
+            "AvgSolvedLineups": mean_or_nan(solved_lineups),
+        })
+
+    out = pd.DataFrame(rows)
+
+    out = out.sort_values(
+        [
+            "SlatesWithWinner",
+            "SlatesWithPrize",
+            "TotalWinningLineups",
+            "TotalPrizeLineups",
+            "AvgPrizeLineupsPerSlate",
+            "MedianPrizeLineupsPerSlate",
+            "AvgBestActualScore",
+            "StdDevPrizeLineups",
+        ],
+        ascending=[False, False, False, False, False, False, False, True],
+    ).reset_index(drop=True)
+
+    return out
 
 
 # =========================================================
@@ -476,15 +565,31 @@ def build_combo_grid(is_multi_game: bool) -> List[Tuple[int, int, float, int]]:
     return deduped
 
 
+def make_threshold_df(players_files: List) -> pd.DataFrame:
+    rows = []
+    for f in players_files:
+        slate_id = extract_contest_id_from_filename(f.name)
+        rows.append({
+            "FileName": f.name,
+            "SlateID": slate_id,
+            "TopScore": 1200.0,
+            "MinPrizeScore": 1000.0,
+        })
+    return pd.DataFrame(rows)
+
+
 def analyse_one_slate(
     uploaded_file,
     merged_df_master: pd.DataFrame,
     required_status_text: str,
     manual_top_score: float,
     manual_min_prize_score: float,
-    progress_bar=None,
-    status_placeholder=None,
-) -> pd.DataFrame:
+    progress_bar,
+    status_placeholder,
+    global_step: int,
+    total_steps: int,
+    global_started: float,
+) -> Tuple[pd.DataFrame, int]:
     players = pd.read_csv(uploaded_file)
     players_df = prepare_players_df(players, required_status_text=required_status_text)
     if players_df.empty:
@@ -501,12 +606,10 @@ def analyse_one_slate(
     )
 
     slate_shape = get_slate_shape(expanded)
-    contest_id = extract_contest_id_from_filename(uploaded_file.name)
+    slate_id = extract_contest_id_from_filename(uploaded_file.name)
     combo_grid = build_combo_grid(slate_shape["is_multi_game"])
 
     combo_rows = []
-    combo_count = len(combo_grid)
-    combo_started = time.time()
 
     for combo_index, (min_diff, max_team_input, max_share, max_team_effective) in enumerate(combo_grid, start=1):
         settings = {
@@ -528,24 +631,27 @@ def analyse_one_slate(
 
         combo_label = f"{min_diff}/{max_team_effective}/{max_share:.2f}"
 
-        if status_placeholder is not None:
-            elapsed = time.time() - combo_started
-            avg_per_combo = elapsed / combo_index if combo_index > 0 else 0
-            remaining = max(combo_count - combo_index, 0) * avg_per_combo
-            status_placeholder.info(
-                f"Solving combo {combo_index}/{combo_count} | "
-                f"{combo_label} | "
-                f"Elapsed: {elapsed:,.1f}s | ETA: {remaining:,.1f}s"
-            )
+        elapsed = time.time() - global_started
+        completed = max(global_step - 1, 0)
+        avg_per_step = (elapsed / completed) if completed > 0 else 0
+        remaining_steps = total_steps - completed
+        eta = remaining_steps * avg_per_step if completed > 0 else 0
+        pct = (completed / total_steps) if total_steps > 0 else 0
 
-        if progress_bar is not None:
-            progress_bar.progress(combo_index / combo_count)
+        progress_bar.progress(min(max(pct, 0.0), 1.0))
+        status_placeholder.info(
+            f"Processing slate {slate_id} | "
+            f"combo {combo_index}/{len(combo_grid)} ({combo_label}) | "
+            f"overall step {completed + 1}/{total_steps} | "
+            f"{pct * 100:,.1f}% complete | "
+            f"elapsed {elapsed:,.1f}s | ETA {eta:,.1f}s"
+        )
 
         solved = solve_top_n_projected_lineups(expanded, settings)
 
         combo_rows.append(
-            summarise_vs_manual_scores(
-                slate_id=contest_id,
+            summarise_combo_for_slate(
+                slate_id=slate_id,
                 combo_label=combo_label,
                 solved=solved,
                 manual_top_score=manual_top_score,
@@ -556,66 +662,96 @@ def analyse_one_slate(
             )
         )
 
-    return pd.DataFrame(combo_rows)
+        global_step += 1
+
+    return pd.DataFrame(combo_rows), global_step
 
 
 # =========================================================
 # STREAMLIT UI
 # =========================================================
-st.set_page_config(page_title="Completed Slate Analyser", layout="wide")
-st.title("Completed Slate Analyser")
-st.caption("Upload one completed players_xxxx CSV and one merged averages file, generate lineups from merged-average rankings, then score those lineups using actual completed-slate results.")
+st.set_page_config(page_title="Completed Slate Combo Benchmark", layout="wide")
+st.title("Completed Slate Combo Benchmark")
+st.caption("Upload multiple completed players_xxxx CSVs and one merged averages file to benchmark which combo performs best across slates.")
 
 with st.sidebar:
     st.header("Inputs")
-    players_file = st.file_uploader("Completed players_xxxx CSV file", type=["csv"])
-    merged_file = st.file_uploader("Merged averages file", type=["csv", "xlsx", "xls"])
+    players_files = st.file_uploader(
+        "Completed players_xxxx CSV files",
+        type=["csv"],
+        accept_multiple_files=True
+    )
+    merged_file = st.file_uploader(
+        "Merged averages file",
+        type=["csv", "xlsx", "xls"]
+    )
     required_status_text = st.text_input(
         "Required Playing Status text",
         value=DEFAULTS["PLAYING_STATUS_REQUIRED_TEXT"]
     )
 
-    manual_top_score = st.number_input(
-        "Actual top score from slate",
-        min_value=0.0,
-        value=1200.0,
-        step=0.1
+    st.header("Current settings")
+    st.write(f"• Salary cap = {DEFAULTS['SALARY_CAP']:,}")
+    st.write(f"• Roster = {DEFAULTS['REQ_DEF']} DEF / {DEFAULTS['REQ_MID']} MID / {DEFAULTS['REQ_FWD']} FWD / {DEFAULTS['REQ_RK']} RK")
+    st.write(f"• Top N lineups per combo = {DEFAULTS['TOP_N_LINEUPS']}")
+    st.write(f"• Solver time limit per lineup = {DEFAULTS['SOLVER_TIME_LIMIT']} sec")
+    st.write("• On 3+ team slates, max players per team is capped at 5 and matchup cap is 5")
+
+st.subheader("Step 1: Upload files")
+st.write("Upload your completed `players_xxxx.csv` files and your merged averages file.")
+
+threshold_df = pd.DataFrame()
+if players_files:
+    threshold_df = make_threshold_df(players_files)
+    st.subheader("Step 2: Enter slate thresholds")
+    st.write("Enter the actual top score and minimum prize-winning score for each slate below.")
+    threshold_df = st.data_editor(
+        threshold_df,
+        use_container_width=True,
+        num_rows="fixed",
+        disabled=["FileName", "SlateID"],
+        key="threshold_editor",
     )
 
-    manual_min_prize_score = st.number_input(
-        "Minimum score that won a prize",
-        min_value=0.0,
-        value=1000.0,
-        step=0.1
-    )
-
-    st.header("Assumptions")
-    st.write("• Top 25 lineups are generated per parameter combination")
-    st.write("• Lineups are built from merged averages / projected ranking")
-    st.write("• Success is measured using manually entered completed-slate thresholds")
-    st.write("• Salary cap = 100,000")
-    st.write("• Roster = 2 DEF / 4 MID / 2 FWD / 1 RK")
-    st.write("• On 3+ team slates, max per team is capped at 5 and max per matchup is also capped at 5")
-    st.write("• Export is limited to ranked combo summary only for faster processing")
-
-run_button = st.button("Analyse completed slate", type="primary")
-
+run_button = st.button("Run multi-slate combo benchmark", type="primary")
 
 if run_button:
     try:
-        if players_file is None:
-            st.error("Please upload one completed players_xxxx.csv file.")
+        if not players_files:
+            st.error("Please upload at least one completed players_xxxx.csv file.")
             st.stop()
 
         if merged_file is None:
             st.error("Please upload the merged averages file.")
             st.stop()
 
-        started = time.time()
+        if threshold_df.empty:
+            st.error("Please enter the TopScore and MinPrizeScore values for each slate.")
+            st.stop()
 
+        required_cols = {"FileName", "SlateID", "TopScore", "MinPrizeScore"}
+        if not required_cols.issubset(set(threshold_df.columns)):
+            st.error("Threshold table is missing required columns.")
+            st.stop()
+
+        threshold_lookup = {}
+        for _, row in threshold_df.iterrows():
+            fname = str(row["FileName"]).strip()
+            top_score = safe_float(row["TopScore"], default=math.nan)
+            min_prize = safe_float(row["MinPrizeScore"], default=math.nan)
+
+            if pd.isna(top_score) or pd.isna(min_prize):
+                st.error(f"Please enter valid TopScore and MinPrizeScore values for {fname}.")
+                st.stop()
+
+            threshold_lookup[fname] = {
+                "TopScore": top_score,
+                "MinPrizeScore": min_prize,
+            }
+
+        started = time.time()
         status_box = st.empty()
         progress_bar = st.progress(0.0)
-        metrics_box = st.empty()
 
         status_box.info("Loading merged averages file...")
 
@@ -626,50 +762,75 @@ if run_button:
 
         merged_df_master = prepare_merged_df(merged_raw)
 
-        status_box.info("Preparing analysis...")
-        progress_bar.progress(0.02)
+        # Work out total steps for ETA
+        total_steps = 0
+        prepped_shapes = []
+        for f in players_files:
+            players_preview = pd.read_csv(f)
+            players_df_preview = prepare_players_df(players_preview, required_status_text=required_status_text)
+            if players_df_preview.empty:
+                raise ValueError(f"No valid players remained after filtering in {f.name}.")
+            expanded_preview = match_players(players_df_preview, merged_df_master, fallback_projection=DEFAULTS["FALLBACK_PROJECTION"])
+            if expanded_preview.empty:
+                raise ValueError(f"No expanded player-position rows were built for {f.name}.")
+            slate_shape_preview = get_slate_shape(expanded_preview)
+            combo_grid_preview = build_combo_grid(slate_shape_preview["is_multi_game"])
+            total_steps += len(combo_grid_preview)
+            prepped_shapes.append((f.name, len(combo_grid_preview)))
 
-        combo_summary_df = analyse_one_slate(
-            uploaded_file=players_file,
-            merged_df_master=merged_df_master,
-            required_status_text=required_status_text,
-            manual_top_score=float(manual_top_score),
-            manual_min_prize_score=float(manual_min_prize_score),
-            progress_bar=progress_bar,
-            status_placeholder=status_box,
-        )
+        all_per_slate_combo = []
+        global_step = 1
 
-        if combo_summary_df.empty:
-            st.error("No combo summaries were produced.")
-            st.stop()
+        for uploaded_file in players_files:
+            if uploaded_file.name not in threshold_lookup:
+                raise ValueError(f"No threshold row found for {uploaded_file.name}.")
+
+            combo_df, global_step = analyse_one_slate(
+                uploaded_file=uploaded_file,
+                merged_df_master=merged_df_master,
+                required_status_text=required_status_text,
+                manual_top_score=float(threshold_lookup[uploaded_file.name]["TopScore"]),
+                manual_min_prize_score=float(threshold_lookup[uploaded_file.name]["MinPrizeScore"]),
+                progress_bar=progress_bar,
+                status_placeholder=status_box,
+                global_step=global_step,
+                total_steps=total_steps,
+                global_started=started,
+            )
+            all_per_slate_combo.append(combo_df)
 
         progress_bar.progress(1.0)
+
+        per_slate_combo_df = pd.concat(all_per_slate_combo, ignore_index=True) if all_per_slate_combo else pd.DataFrame()
+        ranked_combos_df = aggregate_combo_results(per_slate_combo_df)
+
         total_time = time.time() - started
         status_box.success(f"Finished in {total_time:,.1f} seconds")
 
-        ranked_combos_df = (
-            combo_summary_df
-            .sort_values(
-                [
-                    "Generated>=TopScore",
-                    "Generated>=MinPrizeScore",
-                    "BestActualGeneratedScore",
-                    "MeanTop10ActualGeneratedScore",
-                    "BestProjectedGeneratedScore",
-                ],
-                ascending=[False, False, False, False, False],
-            )
-            .reset_index(drop=True)
-        )
+        if ranked_combos_df.empty:
+            st.error("No combo results were produced.")
+            st.stop()
 
-        metrics_box.dataframe(ranked_combos_df, use_container_width=True)
+        st.subheader("Ranked combo benchmark")
+        st.dataframe(ranked_combos_df, use_container_width=True)
+
+        with st.expander("Per-slate combo results"):
+            st.dataframe(per_slate_combo_df, use_container_width=True)
 
         ranked_csv = ranked_combos_df.to_csv(index=False).encode("utf-8")
-        slate_id = extract_contest_id_from_filename(players_file.name)
+        per_slate_csv = per_slate_combo_df.to_csv(index=False).encode("utf-8")
+
         st.download_button(
-            "Download completed_slate_ranked_combos.csv",
+            "Download ranked combo benchmark CSV",
             ranked_csv,
-            file_name=f"completed_slate_ranked_combos_{slate_id}.csv",
+            file_name="completed_slate_ranked_combos.csv",
+            mime="text/csv",
+        )
+
+        st.download_button(
+            "Download per-slate combo results CSV",
+            per_slate_csv,
+            file_name="completed_slate_combo_results_by_slate.csv",
             mime="text/csv",
         )
 
