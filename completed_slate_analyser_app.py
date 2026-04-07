@@ -579,7 +579,8 @@ def make_threshold_df(players_files: List) -> pd.DataFrame:
 
 
 def analyse_one_slate(
-    uploaded_file,
+    file_name: str,
+    players_raw_df: pd.DataFrame,
     merged_df_master: pd.DataFrame,
     required_status_text: str,
     manual_top_score: float,
@@ -590,14 +591,13 @@ def analyse_one_slate(
     total_steps: int,
     global_started: float,
 ) -> Tuple[pd.DataFrame, int]:
-    players = pd.read_csv(uploaded_file)
-    players_df = prepare_players_df(players, required_status_text=required_status_text)
+    players_df = prepare_players_df(players_raw_df, required_status_text=required_status_text)
     if players_df.empty:
-        raise ValueError(f"No valid players remained after filtering in {uploaded_file.name}.")
+        raise ValueError(f"No valid players remained after filtering in {file_name}.")
 
     expanded = match_players(players_df, merged_df_master, fallback_projection=DEFAULTS["FALLBACK_PROJECTION"])
     if expanded.empty:
-        raise ValueError(f"No expanded player-position rows were built for {uploaded_file.name}.")
+        raise ValueError(f"No expanded player-position rows were built for {file_name}.")
 
     unmatched_unique_count = (
         expanded.loc[expanded["MatchMethod"] == "", ["Name"]]
@@ -606,7 +606,7 @@ def analyse_one_slate(
     )
 
     slate_shape = get_slate_shape(expanded)
-    slate_id = extract_contest_id_from_filename(uploaded_file.name)
+    slate_id = extract_contest_id_from_filename(file_name)
     combo_grid = build_combo_grid(slate_shape["is_multi_game"])
 
     combo_rows = []
@@ -762,35 +762,54 @@ if run_button:
 
         merged_df_master = prepare_merged_df(merged_raw)
 
-        # Work out total steps for ETA
+        status_box.info("Loading completed player files...")
+        players_data_map = {}
+
+        for uploaded_file in players_files:
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
+
+            players_raw = pd.read_csv(uploaded_file)
+            if players_raw.empty or len(players_raw.columns) == 0:
+                raise ValueError(f"{uploaded_file.name} appears empty or unreadable.")
+            players_data_map[uploaded_file.name] = players_raw.copy()
+
         total_steps = 0
-        prepped_shapes = []
-        for f in players_files:
-            players_preview = pd.read_csv(f)
-            players_df_preview = prepare_players_df(players_preview, required_status_text=required_status_text)
+        for file_name, players_raw_df in players_data_map.items():
+            players_df_preview = prepare_players_df(players_raw_df, required_status_text=required_status_text)
             if players_df_preview.empty:
-                raise ValueError(f"No valid players remained after filtering in {f.name}.")
-            expanded_preview = match_players(players_df_preview, merged_df_master, fallback_projection=DEFAULTS["FALLBACK_PROJECTION"])
+                raise ValueError(f"No valid players remained after filtering in {file_name}.")
+            expanded_preview = match_players(
+                players_df_preview,
+                merged_df_master,
+                fallback_projection=DEFAULTS["FALLBACK_PROJECTION"]
+            )
             if expanded_preview.empty:
-                raise ValueError(f"No expanded player-position rows were built for {f.name}.")
+                raise ValueError(f"No expanded player-position rows were built for {file_name}.")
             slate_shape_preview = get_slate_shape(expanded_preview)
             combo_grid_preview = build_combo_grid(slate_shape_preview["is_multi_game"])
             total_steps += len(combo_grid_preview)
-            prepped_shapes.append((f.name, len(combo_grid_preview)))
 
         all_per_slate_combo = []
         global_step = 1
 
         for uploaded_file in players_files:
-            if uploaded_file.name not in threshold_lookup:
-                raise ValueError(f"No threshold row found for {uploaded_file.name}.")
+            file_name = uploaded_file.name
+
+            if file_name not in threshold_lookup:
+                raise ValueError(f"No threshold row found for {file_name}.")
+            if file_name not in players_data_map:
+                raise ValueError(f"No loaded player dataframe found for {file_name}.")
 
             combo_df, global_step = analyse_one_slate(
-                uploaded_file=uploaded_file,
+                file_name=file_name,
+                players_raw_df=players_data_map[file_name],
                 merged_df_master=merged_df_master,
                 required_status_text=required_status_text,
-                manual_top_score=float(threshold_lookup[uploaded_file.name]["TopScore"]),
-                manual_min_prize_score=float(threshold_lookup[uploaded_file.name]["MinPrizeScore"]),
+                manual_top_score=float(threshold_lookup[file_name]["TopScore"]),
+                manual_min_prize_score=float(threshold_lookup[file_name]["MinPrizeScore"]),
                 progress_bar=progress_bar,
                 status_placeholder=status_box,
                 global_step=global_step,
